@@ -1,17 +1,31 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { MapPin, Zap, AlertTriangle, CheckCircle, XCircle, ArrowLeft, Battery, Clock, Search, Filter } from "lucide-react";
+import { MapPin, Zap, AlertTriangle, CheckCircle, XCircle, ArrowLeft, Battery, Clock, Search, Filter, Users, Timer, Bell } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import api from "../lib/api";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import Modal from "@/components/ui/Modal";
 
+interface ActiveSessionInfo {
+  startTime: string;
+  estimatedDuration: number | null;
+  elapsedMinutes: number;
+  minutesRemaining: number | null;
+  estimatedFreeAt: string | null;
+}
+
+interface QueueInfo {
+  count: number;
+  userPosition: number | null;
+  userStatus: string | null;
+}
+
 interface Station {
   id: number;
   location: string;
-  city: string; // Adding city to be used for filtering
+  city: string;
   healthPercentage: number;
   isOccupied: boolean;
   isActive: boolean;
@@ -21,6 +35,9 @@ interface Station {
   reseller: string;
   operator: string;
   connectedUser: string | null;
+  activeSession: ActiveSessionInfo | null;
+  isCurrentUserCharging: boolean;
+  queue: QueueInfo;
 }
 
 interface ApiError {
@@ -38,8 +55,11 @@ interface StationDetailModalProps {
   userData: UserData | null;
   onStartCharging: (stationId: number, pointsToUse: number) => void;
   onStopCharging: (stationId: number) => void;
+  onJoinQueue: (stationId: number) => void;
+  onLeaveQueue: (stationId: number) => void;
   isCharging: boolean;
   loading: boolean;
+  queueLoading: boolean;
 }
 
 interface UserData {
@@ -57,6 +77,7 @@ export default function StationsPage() {
   const [error, setError] = useState("");
   const [chargingStations, setChargingStations] = useState<Set<number>>(new Set());
   const [actionLoading, setActionLoading] = useState<number | null>(null);
+  const [queueLoading, setQueueLoading] = useState(false);
   const [cityFilter, setCityFilter] = useState<string>("all");
   const [stationIdSearch, setStationIdSearch] = useState<string>("");
   const [cities, setCities] = useState<string[]>([]);
@@ -66,10 +87,47 @@ export default function StationsPage() {
   const [pointsToUse, setPointsToUse] = useState<number>(10);
   const navigate = useNavigate();
 
+  const fetchStations = useCallback(async (silent = false) => {
+    try {
+      if (!silent) setLoading(true);
+      const response = await api.get("/get/stations");
+      
+      const enhancedStations = response.data.stations.map((station: any) => {
+        const locationParts = station.location.split('-');
+        const city = locationParts.length > 1 ? locationParts[1].trim() : station.location;
+        return { ...station, city };
+      });
+      
+      setStations(enhancedStations);
+      setFilteredStations(enhancedStations);
+
+      // Update selected station if modal is open
+      if (selectedStation) {
+        const updated = enhancedStations.find((s: Station) => s.id === selectedStation.id);
+        if (updated) setSelectedStation(updated);
+      }
+
+      setError("");
+    } catch (err) {
+      console.error("Error fetching stations:", err);
+      if (!silent) setError("Failed to load stations. Please try again.");
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [selectedStation]);
+
   useEffect(() => {
     fetchStations();
     fetchUserData();
   }, []);
+
+  // Auto-refresh every 30 seconds for live time remaining updates
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchStations(true);
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [fetchStations]);
 
   // Filter stations whenever filter criteria change
   useEffect(() => {
@@ -125,54 +183,15 @@ export default function StationsPage() {
     }
   };
 
-  const fetchStations = async () => {
-    try {
-      setLoading(true);
-      const response = await api.get("/get/stations");
-      
-      // Enhance station data with city extraction
-      const enhancedStations = response.data.stations.map((station: any) => {
-        // Extract city from location (assuming format like "Name - City")
-        const locationParts = station.location.split('-');
-        const city = locationParts.length > 1 ? locationParts[1].trim() : station.location;
-        
-        return {
-          ...station,
-          city
-        };
-      });
-      
-      setStations(enhancedStations);
-      setFilteredStations(enhancedStations);
-      setError("");
-    } catch (err) {
-      console.error("Error fetching stations:", err);
-      setError("Failed to load stations. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleStartCharging = async (stationId: number, customPoints?: number) => {
     try {
       setActionLoading(stationId);
       const payload = customPoints ? { CID: stationId, points: customPoints } : { CID: stationId };
-      const response = await api.post("/post/startCharging", payload);
-      console.log("Charging started:", response.data);
-      
-      // Add station to charging set and update stations list
+      await api.post("/post/startCharging", payload);
+
+      // Mark as charging in local set
       setChargingStations(prev => new Set([...prev, stationId]));
-      setFilteredStations(prev => prev.map(station => 
-        station.id === stationId 
-          ? { ...station, isOccupied: true }
-          : station
-      ));
-      setStations(prev => prev.map(station => 
-        station.id === stationId 
-          ? { ...station, isOccupied: true }
-          : station
-      ));
-      
+
       // Update user data with reduced points
       if (userData && customPoints) {
         const currentPoints = parseInt(userData.points);
@@ -181,13 +200,10 @@ export default function StationsPage() {
           points: (currentPoints - customPoints).toString()
         });
       }
-      
-      // Close modal if open
-      setStationModalOpen(false);
-      
-      // Show success message
-      alert(`Charging started successfully at Station #${stationId}`);
-      
+
+      // Fresh fetch so modal gets real activeSession + isCurrentUserCharging + estimated time
+      await fetchStations(true);
+
     } catch (err: unknown) {
       console.error("Error starting charging:", err);
       const errorMessage = (err as ApiError)?.response?.data?.msg || "Failed to start charging. Please try again.";
@@ -203,29 +219,19 @@ export default function StationsPage() {
       const response = await api.post("/post/stopCharging", { CID: stationId });
       console.log("Charging stopped:", response.data);
       
-      // Remove station from charging set and update stations list
+      // Remove station from charging set
       setChargingStations(prev => {
         const newSet = new Set(prev);
         newSet.delete(stationId);
         return newSet;
       });
-      setFilteredStations(prev => prev.map(station => 
-        station.id === stationId 
-          ? { ...station, isOccupied: false }
-          : station
-      ));
-      setStations(prev => prev.map(station => 
-        station.id === stationId 
-          ? { ...station, isOccupied: false }
-          : station
-      ));
-      
-      // Update user data after session
-      await fetchUserData();
-      
+
+      // Fresh fetch + user data so modal reflects freed station
+      await Promise.all([fetchStations(true), fetchUserData()]);
+
       // Show success message with session details
       const sessionInfo = response.data;
-      alert(`Charging stopped successfully!\nTime: ${sessionInfo.totalTime}\nCoins Used: ${sessionInfo.coinsUsed}`);
+      alert(`Charging stopped!\nTime: ${sessionInfo.totalTime}\nCoins Used: ${sessionInfo.coinsUsed}`);
       
     } catch (err: unknown) {
       console.error("Error stopping charging:", err);
@@ -233,6 +239,36 @@ export default function StationsPage() {
       alert(errorMessage);
     } finally {
       setActionLoading(null);
+    }
+  };
+
+  const handleJoinQueue = async (stationId: number) => {
+    try {
+      setQueueLoading(true);
+      const response = await api.post("/post/joinQueue", { CID: stationId });
+      alert(response.data.msg);
+      await fetchStations(true);
+    } catch (err: unknown) {
+      console.error("Error joining queue:", err);
+      const errorMessage = (err as ApiError)?.response?.data?.msg || "Failed to join queue.";
+      alert(errorMessage);
+    } finally {
+      setQueueLoading(false);
+    }
+  };
+
+  const handleLeaveQueue = async (stationId: number) => {
+    try {
+      setQueueLoading(true);
+      const response = await api.post("/post/leaveQueue", { CID: stationId });
+      alert(response.data.msg);
+      await fetchStations(true);
+    } catch (err: unknown) {
+      console.error("Error leaving queue:", err);
+      const errorMessage = (err as ApiError)?.response?.data?.msg || "Failed to leave queue.";
+      alert(errorMessage);
+    } finally {
+      setQueueLoading(false);
     }
   };
 
@@ -301,7 +337,7 @@ export default function StationsPage() {
           <div className="text-center">
             <AlertTriangle className="w-12 h-12 text-red-500 mx-auto mb-4" />
             <p className="text-red-600 mb-4">{error}</p>
-            <Button onClick={fetchStations}>Try Again</Button>
+            <Button onClick={() => fetchStations()}>Try Again</Button>
           </div>
         </div>
       </div>
@@ -379,7 +415,7 @@ export default function StationsPage() {
 
       <div className="container mx-auto px-6 py-8">
         {/* Summary Stats */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-8">
           <Card className="bg-gradient-to-br from-green-500 to-green-600 text-white shadow-md hover:shadow-lg transition-all">
             <CardContent className="p-4">
               <div className="flex items-center justify-between">
@@ -407,6 +443,22 @@ export default function StationsPage() {
                 </div>
                 <div className="w-10 h-10 bg-yellow-400/30 rounded-full flex items-center justify-center">
                   <Clock className="w-6 h-6 text-white" />
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-gradient-to-br from-purple-500 to-purple-600 text-white shadow-md hover:shadow-lg transition-all">
+            <CardContent className="p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-purple-100 text-sm mb-1">Queued</p>
+                  <p className="text-2xl font-bold">
+                    {stations.filter(s => s.queue && s.queue.count > 0).length}
+                  </p>
+                </div>
+                <div className="w-10 h-10 bg-purple-400/30 rounded-full flex items-center justify-center">
+                  <Users className="w-6 h-6 text-white" />
                 </div>
               </div>
             </CardContent>
@@ -525,6 +577,41 @@ export default function StationsPage() {
                       <span className="text-sm font-semibold text-blue-700">{station.connectedUser}</span>
                     </div>
                   )}
+
+                  {/* Time Remaining for occupied stations */}
+                  {station.isOccupied && station.activeSession && (
+                    <div className="flex items-center justify-between bg-amber-50 -mx-2 px-2 py-1.5 rounded">
+                      <span className="text-sm font-medium text-amber-800 flex items-center">
+                        <Timer className="w-3.5 h-3.5 mr-1" />
+                        Free in
+                      </span>
+                      <span className="text-sm font-bold text-amber-700">
+                        {station.activeSession.minutesRemaining !== null 
+                          ? station.activeSession.minutesRemaining <= 0 
+                            ? "Any moment now!" 
+                            : `~${station.activeSession.minutesRemaining} min`
+                          : "Unknown"}
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Queue count */}
+                  {station.queue && station.queue.count > 0 && (
+                    <div className="flex items-center justify-between bg-purple-50 -mx-2 px-2 py-1.5 rounded">
+                      <span className="text-sm font-medium text-purple-800 flex items-center">
+                        <Users className="w-3.5 h-3.5 mr-1" />
+                        In Queue
+                      </span>
+                      <span className="text-sm font-bold text-purple-700">
+                        {station.queue.count} {station.queue.count === 1 ? 'person' : 'people'}
+                        {station.queue.userPosition && (
+                          <span className="ml-1 text-xs bg-purple-200 px-1.5 py-0.5 rounded-full">
+                            You: #{station.queue.userPosition}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {/* View Details Button - Replaces direct action buttons */}
@@ -573,8 +660,11 @@ export default function StationsPage() {
         userData={userData}
         onStartCharging={handleStartCharging}
         onStopCharging={handleStopCharging}
-        isCharging={selectedStation ? chargingStations.has(selectedStation.id) : false}
+        onJoinQueue={handleJoinQueue}
+        onLeaveQueue={handleLeaveQueue}
+        isCharging={selectedStation ? (chargingStations.has(selectedStation.id) || selectedStation.isCurrentUserCharging) : false}
         loading={selectedStation ? actionLoading === selectedStation.id : false}
+        queueLoading={queueLoading}
       />
     </div>
   );
@@ -588,17 +678,55 @@ function StationDetailModal({
   userData, 
   onStartCharging,
   onStopCharging,
+  onJoinQueue,
+  onLeaveQueue,
   isCharging,
-  loading
+  loading,
+  queueLoading
 }: StationDetailModalProps) {
   const [pointsToUse, setPointsToUse] = useState<number>(10);
+  const [countdown, setCountdown] = useState<string>("");
   const userPoints = userData?.points ? parseInt(userData.points) : 0;
+
+  // Live countdown timer
+  useEffect(() => {
+    if (!station?.activeSession?.estimatedFreeAt) {
+      setCountdown("");
+      return;
+    }
+
+    const updateCountdown = () => {
+      const freeAt = new Date(station.activeSession!.estimatedFreeAt!).getTime();
+      const now = Date.now();
+      const diff = freeAt - now;
+
+      if (diff <= 0) {
+        setCountdown("Finishing up...");
+        return;
+      }
+
+      const hours = Math.floor(diff / 3600000);
+      const minutes = Math.floor((diff % 3600000) / 60000);
+      const seconds = Math.floor((diff % 60000) / 1000);
+
+      if (hours > 0) {
+        setCountdown(`${hours}h ${minutes}m ${seconds}s`);
+      } else if (minutes > 0) {
+        setCountdown(`${minutes}m ${seconds}s`);
+      } else {
+        setCountdown(`${seconds}s`);
+      }
+    };
+
+    updateCountdown();
+    const interval = setInterval(updateCountdown, 1000);
+    return () => clearInterval(interval);
+  }, [station?.activeSession?.estimatedFreeAt]);
 
   // Validate points input
   const handlePointsChange = (value: string) => {
     const numValue = parseInt(value);
     if (!isNaN(numValue) && numValue > 0) {
-      // Don't allow more points than user has
       if (numValue <= userPoints) {
         setPointsToUse(numValue);
       } else {
@@ -609,9 +737,30 @@ function StationDetailModal({
 
   if (!isOpen || !station) return null;
 
+  const isUserInQueue = station.queue?.userPosition !== null && station.queue?.userPosition > 0;
+  const isFirstInQueue = station.queue?.userPosition === 1;
+  const isNotified = station.queue?.userStatus === "NOTIFIED";
+
   return (
     <Modal isOpen={isOpen} onClose={onClose} title={`Station #${station.id} Details`}>
       <div className="space-y-6">
+        {/* Map Preview */}
+        <div className="rounded-lg overflow-hidden border border-gray-200">
+          <iframe
+            src={[
+              "https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3818.579888814001!2d74.59648567604198!3d16.847184983950903!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3bc1230022fe31f5%3A0x121957a2c3e10a18!2sR%20city%20mall!5e0!3m2!1sen!2sin!4v1772685960972!5m2!1sen!2sin",
+              "https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3818.5588809933924!2d74.59312927604199!3d16.848225883949958!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3bc12282a750bba7%3A0x77d299df3df3e31!2sHotel%20Pai%20Prakash!5e0!3m2!1sen!2sin!4v1772686275881!5m2!1sen!2sin",
+              "https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d1706.1314158003859!2d74.57590458963301!3d16.84559673080401!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3bc11942e00b2813%3A0x6ee1615e6e49b25e!2sD-mart%20Sangli!5e0!3m2!1sen!2sin!4v1772686370655!5m2!1sen!2sin"
+            ][station.id % 3]}
+            width="100%"
+            height="200"
+            style={{ border: 0 }}
+            allowFullScreen
+            loading="lazy"
+            referrerPolicy="no-referrer-when-downgrade"
+          />
+        </div>
+
         {/* Station Info */}
         <div className="bg-blue-50 p-4 rounded-lg border border-blue-100">
           <h3 className="font-semibold text-lg text-blue-800 mb-3 flex items-center">
@@ -660,6 +809,138 @@ function StationDetailModal({
             </div>
           </div>
         </div>
+
+        {/* Time Remaining Section - shown for occupied stations */}
+        {station.isOccupied && station.activeSession && (
+          <div className="bg-amber-50 p-4 rounded-lg border border-amber-200">
+            <h3 className="font-semibold text-lg text-amber-800 mb-3 flex items-center">
+              <Timer className="w-5 h-5 mr-2 text-amber-600" />
+              Estimated Availability
+            </h3>
+            <div className="space-y-3">
+              <div className="flex justify-between">
+                <span className="text-gray-700 font-medium">Charging since:</span>
+                <span className="font-medium text-gray-900">
+                  {station.activeSession.elapsedMinutes} min ago
+                </span>
+              </div>
+              {station.activeSession.estimatedDuration ? (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-gray-700 font-medium">Est. total duration:</span>
+                    <span className="font-medium text-gray-900">
+                      {station.activeSession.estimatedDuration} min
+                    </span>
+                  </div>
+                  <div className="text-center py-3 bg-amber-100 rounded-lg">
+                    <p className="text-xs text-amber-700 uppercase font-semibold tracking-wide mb-1">
+                      Station free in
+                    </p>
+                    <p className="text-3xl font-bold text-amber-800 font-mono">
+                      {countdown || "Calculating..."}
+                    </p>
+                  </div>
+                  {station.activeSession.minutesRemaining !== null && station.activeSession.minutesRemaining <= 5 && (
+                    <div className="flex items-center bg-green-100 p-2 rounded text-green-800 text-sm">
+                      <Bell className="w-4 h-4 mr-2 flex-shrink-0" />
+                      <span className="font-medium">Almost free! Station will be available very soon.</span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="text-center py-3 bg-amber-100 rounded-lg">
+                  <p className="text-sm text-amber-700">
+                    Duration unknown (pay-per-use session). The user can stop at any time.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Queue Section - shown for occupied stations when user is NOT charging */}
+        {station.isOccupied && !isCharging && (
+          <div className="bg-purple-50 p-4 rounded-lg border border-purple-200">
+            <h3 className="font-semibold text-lg text-purple-800 mb-3 flex items-center">
+              <Users className="w-5 h-5 mr-2 text-purple-600" />
+              Waiting Queue
+            </h3>
+            
+            <div className="space-y-3">
+              <div className="flex justify-between">
+                <span className="text-gray-700 font-medium">People in queue:</span>
+                <span className="font-bold text-purple-800">{station.queue?.count || 0}</span>
+              </div>
+
+              {isUserInQueue ? (
+                <div className="space-y-3">
+                  <div className={`text-center py-3 rounded-lg ${
+                    isNotified ? 'bg-green-100 border border-green-300' : 'bg-purple-100'
+                  }`}>
+                    {isNotified ? (
+                      <>
+                        <div className="flex items-center justify-center mb-1">
+                          <Bell className="w-5 h-5 text-green-600 mr-2 animate-bounce" />
+                          <p className="text-sm font-bold text-green-800 uppercase">It's your turn!</p>
+                        </div>
+                        <p className="text-xs text-green-700">
+                          The station is now free. Start charging before someone else does!
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-xs text-purple-700 uppercase font-semibold tracking-wide mb-1">
+                          Your position
+                        </p>
+                        <p className="text-4xl font-bold text-purple-800">
+                          #{station.queue.userPosition}
+                        </p>
+                        <p className="text-xs text-purple-600 mt-1">
+                          {station.queue.userPosition === 1 
+                            ? "You're next! You'll be notified when the station is free."
+                            : `${(station.queue.userPosition || 0) - 1} ${(station.queue.userPosition || 0) - 1 === 1 ? 'person' : 'people'} ahead of you`
+                          }
+                        </p>
+                      </>
+                    )}
+                  </div>
+                  <Button
+                    className="w-full bg-red-100 hover:bg-red-200 text-red-700 border border-red-300"
+                    variant="outline"
+                    onClick={() => onLeaveQueue(station.id)}
+                    disabled={queueLoading}
+                  >
+                    {queueLoading ? (
+                      <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full animate-spin mr-2"></div>
+                    ) : (
+                      <XCircle className="w-4 h-4 mr-2" />
+                    )}
+                    Leave Queue
+                  </Button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-sm text-purple-700 bg-purple-100 p-2 rounded">
+                    Join the queue to reserve your spot. You'll be notified when it's your turn to charge.
+                    {station.queue?.count > 0 && ` You'll be position #${station.queue.count + 1}.`}
+                  </p>
+                  <Button
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white"
+                    onClick={() => onJoinQueue(station.id)}
+                    disabled={queueLoading}
+                  >
+                    {queueLoading ? (
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2"></div>
+                    ) : (
+                      <Users className="w-4 h-4 mr-2" />
+                    )}
+                    Join Queue
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         
         {/* User Info */}
         {userData && (
@@ -685,13 +966,40 @@ function StationDetailModal({
           </div>
         )}
 
-        {/* Charging Controls */}
+        {/* Charging Controls - only show if station is available (or user is first in queue for a now-free station) */}
         {!isCharging && station.isActive && !station.isOccupied && !station.isFaulty && (
           <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-100">
             <h3 className="font-semibold text-lg text-yellow-800 mb-3 flex items-center">
               <Zap className="w-5 h-5 mr-2 text-yellow-600" />
               Start Charging
             </h3>
+
+            {/* Queue conflict warning */}
+            {station.queue?.count > 0 && !isFirstInQueue && (
+              <div className="flex items-start bg-red-100 p-3 rounded mb-4 border border-red-200">
+                <AlertTriangle className="w-5 h-5 text-red-600 mr-2 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-semibold text-red-800">Queue active</p>
+                  <p className="text-xs text-red-700">
+                    There are {station.queue.count} people waiting in queue. Join the queue to wait for your turn.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Show green priority banner if user is first in queue */}
+            {isFirstInQueue && (
+              <div className="flex items-start bg-green-100 p-3 rounded mb-4 border border-green-200">
+                <CheckCircle className="w-5 h-5 text-green-600 mr-2 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-semibold text-green-800">You have priority!</p>
+                  <p className="text-xs text-green-700">
+                    You are #1 in the queue. Start charging now before your turn expires!
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-800 mb-2">
@@ -764,12 +1072,16 @@ function StationDetailModal({
           </div>
         )}
 
-        {/* Not Available Message */}
-        {(station.isFaulty || !station.isActive || (station.isOccupied && !isCharging)) && (
+        {/* Not Available Message - only show if station is truly unavailable AND user isn't in queue section */}
+        {!isCharging && (station.isFaulty || !station.isActive) && (
           <div className="bg-gray-100 p-4 rounded-lg border border-gray-200">
             <div className="flex items-center justify-center text-gray-700 p-2">
               <AlertTriangle className="w-5 h-5 mr-2 text-gray-600" />
-              <span className="font-medium">This station is not available for charging at the moment.</span>
+              <span className="font-medium">
+                {station.isFaulty 
+                  ? "This station is faulty and cannot be used." 
+                  : "This station is currently inactive."}
+              </span>
             </div>
           </div>
         )}
